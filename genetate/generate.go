@@ -9,6 +9,8 @@ import (
 	"flag"
 	"fmt"
 	"math/big"
+	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -21,9 +23,7 @@ var (
 	caStateOrProvinceName string
 	caEmailAddress        string
 
-	dns    string
-	output string
-	shell  string
+	currentDir string
 )
 
 func init() {
@@ -34,6 +34,9 @@ func init() {
 	flag.StringVar(&caOrganizationalUnit, "caOrganizationalUnit", "OrganizationalUnit", "CA Organizational Unit")
 	flag.StringVar(&caStateOrProvinceName, "caStateOrProvinceName", "NSW", "CA State Or Province Name")
 	flag.StringVar(&caEmailAddress, "caEmailAddress", "nobody@email.com", "CA Email Address")
+
+	currentDir, _ := os.Getwd()
+	os.MkdirAll(filepath.Join(currentDir, caDir), 0700)
 }
 
 func GenRootCA() {
@@ -56,19 +59,62 @@ func GenRootCA() {
 		SignatureAlgorithm:    x509.SHA256WithRSA,
 		MaxPathLen:            2,
 	}
+
+	// private key
 	rsaPrivateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		panic(err)
 	}
+	priBytes, err := x509.MarshalPKCS8PrivateKey(rsaPrivateKey)
+	if err != nil {
+		fmt.Printf("marshal PKCS8 private key err: %s \n", err)
+		panic(err)
+	}
+	privatePem, err := os.Create(filepath.Join(caDir, "ca.key"))
+	if err != nil {
+		fmt.Printf("error when create ca.pem: %s \n", err)
+		panic(err)
+	}
+	privateKeyBlock := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: priBytes}
+	err = pem.Encode(privatePem, privateKeyBlock)
+	if err != nil {
+		fmt.Printf("error when encode private: %s \n", err)
+		panic(err)
+	}
 
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(rsaPrivateKey)})
-	_, certPEM := genCert(&rootTemplate, &rootTemplate, &rsaPrivateKey.PublicKey, rsaPrivateKey)
+	// certificate
+	_, certBlock, err := genCert(&rootTemplate, &rootTemplate, &rsaPrivateKey.PublicKey, rsaPrivateKey)
+	caCrt, err := os.Create(filepath.Join(caDir, "ca.crt"))
+	if err != nil {
+		fmt.Printf("error when create ca.crt: %s \n", err)
+		panic(err)
+	}
+	err = pem.Encode(caCrt, certBlock)
+	if err != nil {
+		fmt.Printf("error when encode ca crt: %s \n", err)
+		panic(err)
+	}
 
-	fmt.Println(string(keyPEM))
-	fmt.Println(string(certPEM))
+	// public key
+	publicKeyBytes, err := x509.MarshalPKIXPublicKey(&rsaPrivateKey.PublicKey)
+	if err != nil {
+		fmt.Printf("error when dumping publickey: %s \n", err)
+		panic(err)
+	}
+	publicKeyBlock := &pem.Block{Type: "PUBLIC KEY", Bytes: publicKeyBytes}
+	publicPem, err := os.Create(filepath.Join(caDir, "ca.pem"))
+	if err != nil {
+		fmt.Printf("error when create public.pem: %s \n", err)
+		panic(err)
+	}
+	err = pem.Encode(publicPem, publicKeyBlock)
+	if err != nil {
+		fmt.Printf("error when create public.pem: %s \n", err)
+		panic(err)
+	}
 }
 
-func GenServerCert(caCert *x509.Certificate, caKey *rsa.PrivateKey, domains []string) (*x509.Certificate, []byte, *rsa.PrivateKey) {
+func GenServerCert(caCert *x509.Certificate, caKey *rsa.PrivateKey, domains []string) (*x509.Certificate, *pem.Block, *rsa.PrivateKey) {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		panic(err)
@@ -87,37 +133,34 @@ func GenServerCert(caCert *x509.Certificate, caKey *rsa.PrivateKey, domains []st
 			SerialNumber:       "",
 			CommonName:         "",
 		},
-		NotBefore:      time.Now().Add(-10 * time.Second),
-		NotAfter:       time.Now().AddDate(10, 0, 0),
-		KeyUsage:       x509.KeyUsageCRLSign,
-		ExtKeyUsage:    []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		IsCA:           false,
-		MaxPathLenZero: true,
-		DNSNames:       domains,
+		NotBefore:          time.Now().Add(-10 * time.Second),
+		NotAfter:           time.Now().AddDate(10, 0, 0),
+		KeyUsage:           x509.KeyUsageCRLSign,
+		ExtKeyUsage:        []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		SignatureAlgorithm: x509.SHA256WithRSA,
+		IsCA:               false,
+		MaxPathLenZero:     true,
+		DNSNames:           domains,
 	}
 
-	serverCert, serverPEM := genCert(&serverTemplate, caCert, &privateKey.PublicKey, caKey)
-	return serverCert, serverPEM, privateKey
-
+	serverCert, serverBlock, err := genCert(&serverTemplate, caCert, &privateKey.PublicKey, caKey)
+	return serverCert, serverBlock, privateKey
 }
 
-func genCert(template, parent *x509.Certificate, publicKey *rsa.PublicKey, privateKey *rsa.PrivateKey) (*x509.Certificate, []byte) {
+func genCert(template, parent *x509.Certificate, publicKey *rsa.PublicKey, privateKey *rsa.PrivateKey) (*x509.Certificate, *pem.Block, error) {
 	certBytes, err := x509.CreateCertificate(rand.Reader, template, parent, publicKey, privateKey)
 	if err != nil {
-		panic("Failed to create certificate:" + err.Error())
+		return nil, nil, err
 	}
-	
+
 	cert, err := x509.ParseCertificate(certBytes)
 	if err != nil {
-		panic("Failed to parse certificate:" + err.Error())
+		return nil, nil, err
 	}
 
-	b := pem.Block{Type: "CERTIFICATE REQUEST", Bytes: certBytes}
-	certPEM := pem.EncodeToMemory(&b)
-
-	return cert, certPEM
+	return cert, &pem.Block{Type: "CERTIFICATE", Bytes: certBytes}, nil
 }
 
 func main() {
-	GenRootCA()
+
 }
